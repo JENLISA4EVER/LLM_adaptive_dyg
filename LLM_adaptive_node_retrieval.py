@@ -172,6 +172,11 @@ def batch_score_candidates_with_llm(
 
 def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_embeddings, relations_map, node_num):
     print(f"\n--- 5. 开始节点检索评估 [采样策略: {args.neg_sampling_strategy}] ---")
+
+    PROMPT_PREAMBLE = ""
+    PROMPT_PREAMBLE += "You are a link prediction expert in a dynamic graph. Based on the examples of past interactions, determine which of the two new nodes is more likely to connect with the query node.\n\n"
+    PROMPT_PREAMBLE += "In the following quadruple `(u, r, v, t)` examples, `u` is the source node ID, `r` is the text describing the link type, `v` is the destination node ID, and `t` is the timestamp of the interaction.\n\n"
+
     
     # =======================================================================
     # Phase 0: 全局信息预计算
@@ -377,7 +382,7 @@ def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_
 
             '''
             candidate_scores = batch_score_candidates_with_llm(
-                prompt_template, q_head, retrieval_pool, anchor_node, tokenizer, model
+                PROMPT_PREAMBLE + prompt_template, q_head, retrieval_pool, anchor_node, tokenizer, model
             )
             
             
