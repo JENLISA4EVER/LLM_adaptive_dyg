@@ -21,7 +21,7 @@ from sentence_transformers import util
 from vllm import LLM, SamplingParams
 
 # 直接从我们现有的脚本中导入所有需要的函数
-from run_recall import get_query, get_llm_data, get_active_i_set, get_candidate_set, get_structural_nodes, get_semantically_similar_nodes, get_or_compute_entity_embeddings
+from run_recall import get_query, get_llm_data, get_dtgb_data, get_active_i_set, get_candidate_set, get_structural_nodes, get_semantically_similar_nodes, get_or_compute_entity_embeddings
 from run_scoring import calculate_candidate_scores, RandomProjectionModule
 from LLM_adaptive_link_prediction import get_adaptive_hyperparameters, partition_samples, build_few_shot_prompt, verify_and_create_sample_quadruples_optimized
 from utils.realtime_plotter import RealtimePlotter
@@ -433,6 +433,15 @@ def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_
 def main():
     parser = argparse.ArgumentParser(description="动态图节点检索任务评估脚本")
     
+    # --- 【新增】实验设置参数 ---
+    parser.add_argument(
+        '--setting',
+        type=str,
+        default='transductive',
+        choices=['transductive', 'inductive'],
+        help="实验设置: 'transductive' (默认) 或 'inductive'."
+    )
+    
     # 数据和路径参数
     parser.add_argument('--dataset_name', type=str, default='ICEWS1819', help='数据集名称')
     parser.add_argument('--base_data_dir', type=str, default='/home/gtang/DTGB-main/DyLink_Datasets', help='数据集存放的基础目录')
@@ -465,6 +474,7 @@ def main():
     parser.add_argument('--num_neg', type=int, default=99, help='每条数据的负采样数量')
     parser.add_argument('--k_values', type=int, nargs='+', default=[1, 3, 10], help='用于评估Hits@K的K值列表')
     parser.add_argument('--enable_plotting', action='store_true', help='Enable real-time plotting of performance metrics.')
+    parser.add_argument('--seed_value', type=int, default=42, help='随机种子数值')
     
     # --- 负采样策略参数 ---
     parser.add_argument(
@@ -508,14 +518,19 @@ def main():
     args = parser.parse_args()
 
     # 设置随机种子
-    random.seed(42); np.random.seed(42); torch.manual_seed(42)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
+    random.seed(args.seed_value); np.random.seed(args.seed_value); torch.manual_seed(args.seed_value)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed_value)
 
     # --- 主流程 ---
-    print("--- 1. 正在加载和处理数据... ---")
-    entities, relations, train_list, val_list, test_list, node_num, rel_num = get_llm_data(
-        args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
-    )
+    print(f"--- 1. 正在加载和处理数据 (模式: {args.setting}) ---")
+    if args.setting == 'transductive':
+        entities, relations, train_list, val_list, test_list, node_num, _ = get_llm_data(
+            args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
+        )
+    else: # inductive
+        entities, relations, train_list, val_list, _, test_list, node_num = get_dtgb_data(
+            args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
+        )
     relations_map = {rel_id: rel_text for rel_id, rel_text in relations}
 
     print("\n--- 2. 正在准备节点语义向量... ---")

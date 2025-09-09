@@ -17,7 +17,7 @@ from sentence_transformers import util # 【新增】为计算语义相似度标
 # 从我们之前的脚本中导入必要的函数
 from utils.realtime_plotter import RealtimePlotter
 from utils.dynamic_few_shot import FewShotManager
-from run_recall import get_query, get_llm_data, get_active_i_set, get_candidate_set, get_structural_nodes, get_semantically_similar_nodes, get_or_compute_entity_embeddings
+from run_recall import get_query, get_llm_data, get_dtgb_data, get_active_i_set, get_candidate_set, get_structural_nodes, get_semantically_similar_nodes, get_or_compute_entity_embeddings
 from run_scoring import calculate_candidate_scores, RandomProjectionModule
 
 # =====================================================================================
@@ -392,7 +392,7 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, test_list, al
     if args.enable_plotting:
         plotter = RealtimePlotter(
             task_name='Link Prediction',
-            save_path='link_prediction_metrics.png',
+            save_path='link_prediction_metrics.pdf',
             metrics=['ROC AUC', 'AP']
         )
 
@@ -468,12 +468,23 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, test_list, al
             fallback_sampling = False
 
             if args.neg_sampling_strategy == 'recall_pool':
-                # [新增] 策略5: 直接从完整召回池中采样
-                potential_negatives = list(candidate_set_C - {q_tail_true})
+                # 策略5: 为负采样，使用默认k值重新构建一个独立的召回池
+                
+                # 1. 使用默认k值 (args.k_*) 进行三路召回
+                time_recalled_ids_neg = {node_id for node_id, _ in get_active_i_set(q_time, 55, initial_history)}
+                struc_recalled_ids_neg = {node_id for node_id, _ in get_structural_nodes(q_head, 55, adj)}
+                sem_recalled_ids_neg = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, 55, all_semantic_embeddings)}
+                
+                # 2. 合并成一个专用于负采样的召回池
+                neg_sampling_recall_pool = time_recalled_ids_neg.union(struc_recalled_ids_neg, sem_recalled_ids_neg)
+
+                # 3. 从这个新生成的、非自适应的池子中进行负采样
+                potential_negatives = list(neg_sampling_recall_pool - {q_head, q_tail_true})
+                
                 if potential_negatives:
                     q_tail_neg = random.choice(potential_negatives)
                 else:
-                    # 备用方案: 如果召回池只有正确答案，则退回全局采样
+                    # 如果新池子为空或只有无效节点，则退回全局采样
                     fallback_sampling = True
             
             if args.neg_sampling_strategy == 'hard_positive':
@@ -627,6 +638,15 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, test_list, al
 def main():
     parser = argparse.ArgumentParser(description="动态图链接预测-完全自适应LLM预测脚本")
     
+    # --- 【新增】实验设置参数 ---
+    parser.add_argument(
+        '--setting',
+        type=str,
+        default='transductive',
+        choices=['transductive', 'inductive'],
+        help="实验设置: 'transductive' (默认) 或 'inductive'."
+    )
+
     # 数据和路径参数
     parser.add_argument('--dataset_name', type=str, default='ICEWS1819', help='数据集名称')
     parser.add_argument('--base_data_dir', type=str, default='/home/gtang/DTGB-main/DyLink_Datasets', help='数据集存放的基础目录')
@@ -657,6 +677,7 @@ def main():
     parser.add_argument('--print_interval', type=int, default=50, help='每隔多少个测试事件打印一次中间指标')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='运行设备 (cuda or cpu)')
     parser.add_argument('--enable_plotting', action='store_true', help='Enable real-time plotting of performance metrics.')
+    parser.add_argument('--seed_value', type=int, default=42, help='随机种子数值')
     
     # --- 负采样策略参数 ---
     parser.add_argument(
@@ -701,16 +722,21 @@ def main():
     args = parser.parse_args()
 
     # --- [新增] 在所有操作开始前设置随机种子 ---
-    seed_value = 42  # 选择任何固定的整数
+    seed_value = args.seed_value  # 选择任何固定的整数
     random.seed(seed_value)
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
 
     # --- 主流程 ---
-    print("--- 1. 正在加载和处理数据... ---")
-    entities, relations, train_list, val_list, test_list, node_num, rel_num = get_llm_data(
-        args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
-    )
+    print(f"--- 1. 正在加载和处理数据 (模式: {args.setting}) ---")
+    if args.setting == 'transductive':
+        entities, relations, train_list, val_list, test_list, node_num, _ = get_llm_data(
+            args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
+        )
+    else: # inductive
+        entities, relations, train_list, val_list, _, test_list, node_num = get_dtgb_data(
+            args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
+        )
     relations_map = {rel_id: rel_text for rel_id, rel_text in relations}
 
     print("\n--- 2. 正在准备节点语义向量... ---")
