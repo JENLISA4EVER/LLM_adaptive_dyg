@@ -17,7 +17,7 @@ from sentence_transformers import util # 【新增】为计算语义相似度标
 # 从我们之前的脚本中导入必要的函数
 from utils.realtime_plotter import RealtimePlotter
 from utils.dynamic_few_shot import FewShotManager
-from run_recall import get_query, get_llm_data, get_dtgb_data, get_active_i_set, get_candidate_set, get_structural_nodes, get_semantically_similar_nodes, get_or_compute_entity_embeddings
+from run_recall import get_query, load_data_for_evaluation, get_active_i_set, get_candidate_set, get_structural_nodes, get_semantically_similar_nodes, get_or_compute_entity_embeddings
 from run_scoring import calculate_candidate_scores, RandomProjectionModule
 
 # =====================================================================================
@@ -729,14 +729,16 @@ def main():
 
     # --- 主流程 ---
     print(f"--- 1. 正在加载和处理数据 (模式: {args.setting}) ---")
+    entities, relations, train_list, val_list, test_list_trans, test_list_ind, node_num = load_data_for_evaluation(
+        args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
+    )
+    
+    # 根据 setting 选择测试集
     if args.setting == 'transductive':
-        entities, relations, train_list, val_list, test_list, node_num, _ = get_llm_data(
-            args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
-        )
+        test_list = test_list_trans
     else: # inductive
-        entities, relations, train_list, val_list, _, test_list, node_num = get_dtgb_data(
-            args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
-        )
+        test_list = test_list_ind
+        
     relations_map = {rel_id: rel_text for rel_id, rel_text in relations}
 
     print("\n--- 2. 正在准备节点语义向量... ---")

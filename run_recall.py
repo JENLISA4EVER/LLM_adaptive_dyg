@@ -16,25 +16,11 @@ from sentence_transformers import SentenceTransformer, util
 # 1. 数据加载与预处理函数
 # =====================================================================================
 
-class Data:
+def load_data_for_evaluation(dataset_name: str, base_data_dir: str, val_ratio: float, test_ratio: float):
     """
-    Data object to store the nodes interaction information, adapted from DTGB.
-    """
-    def __init__(self, src_node_ids: np.ndarray, dst_node_ids: np.ndarray, node_interact_times: np.ndarray, edge_ids: np.ndarray, labels: np.ndarray):
-        self.src_node_ids = src_node_ids
-        self.dst_node_ids = dst_node_ids
-        self.node_interact_times = node_interact_times
-        self.edge_ids = edge_ids
-        self.labels = labels
-        self.num_interactions = len(src_node_ids)
-        self.unique_node_ids = set(src_node_ids) | set(dst_node_ids)
-        self.num_unique_nodes = len(self.unique_node_ids)
-
-
-def get_dtgb_data(dataset_name: str, base_data_dir: str, val_ratio: float, test_ratio: float):
-    """
-    【新增】从 DTGB 迁移并适配的数据加载函数，支持 inductive 划分。
-    Loads and processes dynamic graph data with transductive and inductive splits.
+    【全新修订版】
+    为评估加载数据，确保在任何设置下都使用完整的训练和验证历史，
+    同时提供 transductive 和 inductive 两个独立的测试集。
     """
     base_path = os.path.join(base_data_dir, dataset_name)
     graph_df = pd.read_csv(os.path.join(base_path, 'edge_list.csv'), index_col=0)
@@ -48,6 +34,20 @@ def get_dtgb_data(dataset_name: str, base_data_dir: str, val_ratio: float, test_
     
     graph_df = graph_df.sort_values('ts').reset_index(drop=True)
 
+    # --- 步骤 1: 进行标准的时间划分，获得完整的训练和验证集 ---
+    n_total = len(graph_df)
+    n_val = int(n_total * val_ratio)
+    n_test = int(n_total * test_ratio)
+    n_train = n_total - n_val - n_test
+    
+    full_train_df = graph_df.iloc[:n_train]
+    full_val_df = graph_df.iloc[n_train : n_train + n_val]
+    
+    # 这部分是模型在测试时能看到的完整历史
+    full_train_list = full_train_df[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
+    full_val_list = full_val_df[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
+    
+    # --- 步骤 2: 单独使用 DTGB 逻辑来构造 inductive 测试集 ---
     src_node_ids = graph_df.u.values.astype(np.longlong)
     dst_node_ids = graph_df.i.values.astype(np.longlong)
     node_interact_times = graph_df.ts.values.astype(np.float64)
@@ -55,54 +55,34 @@ def get_dtgb_data(dataset_name: str, base_data_dir: str, val_ratio: float, test_
     labels = graph_df.label.values
 
     val_time, test_time = np.quantile(node_interact_times, [1 - val_ratio - test_ratio, 1 - test_ratio])
-
-    # --- Inductive Split Logic from DTGB ---
-    random.seed(2020) # Use a fixed seed for reproducibility
+    
+    random.seed(2020) # 固定种子以保证每次划分一致
     node_set = set(src_node_ids) | set(dst_node_ids)
-    num_total_unique_node_ids = len(node_set)
     test_node_set = set(src_node_ids[node_interact_times > val_time]).union(set(dst_node_ids[node_interact_times > val_time]))
-    new_test_node_set = set(random.sample(list(test_node_set), int(0.1 * num_total_unique_node_ids)))
+    new_test_node_set = set(random.sample(list(test_node_set), int(0.1 * len(node_set))))
 
-    new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
-    new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
-    observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
-
-    train_mask = np.logical_and(node_interact_times <= val_time, observed_edges_mask)
-    train_data = Data(src_node_ids[train_mask], dst_node_ids[train_mask], node_interact_times[train_mask], edge_ids[train_mask], labels[train_mask])
-
-    train_node_set = set(train_data.src_node_ids) | set(train_data.dst_node_ids)
+    # 训练集掩码 (用于识别新节点时需要)
+    train_mask_for_new_node_identification = node_interact_times <= val_time
+    train_node_set = set(src_node_ids[train_mask_for_new_node_identification]) | set(dst_node_ids[train_mask_for_new_node_identification])
     new_node_set = node_set - train_node_set
-
-    val_mask = np.logical_and(node_interact_times > val_time, node_interact_times <= test_time)
+    
+    # 生成 Transductive 和 Inductive 测试集
     test_mask = node_interact_times > test_time
-
+    test_df_transductive = graph_df[test_mask]
+    
     edge_contains_new_node_mask = np.array([(src in new_node_set or dst in new_node_set) for src, dst in zip(src_node_ids, dst_node_ids)])
-    
-    new_node_val_mask = np.logical_and(val_mask, edge_contains_new_node_mask)
     new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
+    test_df_inductive = graph_df[new_node_test_mask]
 
-    # Create Data objects for each split
-    val_data = Data(src_node_ids[val_mask], dst_node_ids[val_mask], node_interact_times[val_mask], edge_ids[val_mask], labels[val_mask])
-    test_data = Data(src_node_ids[test_mask], dst_node_ids[test_mask], node_interact_times[test_mask], edge_ids[test_mask], labels[test_mask])
-    new_node_val_data = Data(src_node_ids[new_node_val_mask], dst_node_ids[new_node_val_mask], node_interact_times[new_node_val_mask], edge_ids[new_node_val_mask], labels[new_node_val_mask])
-    new_node_test_data = Data(src_node_ids[new_node_test_mask], dst_node_ids[new_node_test_mask], node_interact_times[new_node_test_mask], edge_ids[new_node_test_mask], labels[new_node_test_mask])
+    test_list_transductive = test_df_transductive[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
+    test_list_inductive = test_df_inductive[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
 
-    print("--- Data Loading (Inductive Setting from DTGB) ---")
-    print(f"Total interactions: {len(src_node_ids)}, Total unique nodes: {num_total_unique_node_ids}")
-    print(f"Train interactions: {train_data.num_interactions}, Train unique nodes: {train_data.num_unique_nodes}")
-    print(f"Validation interactions (transductive): {val_data.num_interactions}")
-    print(f"Test interactions (transductive): {test_data.num_interactions}")
-    print(f"Validation interactions (inductive): {new_node_val_data.num_interactions}")
-    print(f"Test interactions (inductive): {new_node_test_data.num_interactions}")
-    print(f"Number of new nodes for inductive testing: {len(new_test_node_set)}")
-    
-    # Convert Data objects to simple lists for compatibility
-    train_list = list(zip(train_data.src_node_ids, train_data.edge_ids, train_data.dst_node_ids, train_data.node_interact_times, train_data.labels, range(len(train_data.src_node_ids))))
-    val_list = list(zip(val_data.src_node_ids, val_data.edge_ids, val_data.dst_node_ids, val_data.node_interact_times, val_data.labels, range(len(val_data.src_node_ids))))
-    test_list_transductive = list(zip(test_data.src_node_ids, test_data.edge_ids, test_data.dst_node_ids, test_data.node_interact_times, test_data.labels, range(len(test_data.src_node_ids))))
-    test_list_inductive = list(zip(new_node_test_data.src_node_ids, new_node_test_data.edge_ids, new_node_test_data.dst_node_ids, new_node_test_data.node_interact_times, new_node_test_data.labels, range(len(new_node_test_data.src_node_ids))))
+    print("--- Data Loading (Corrected Logic) ---")
+    print(f"Full history for model (Train + Val): {len(full_train_list) + len(full_val_list)} interactions")
+    print(f"Test Set (Transductive): {len(test_list_transductive)} interactions")
+    print(f"Test Set (Inductive): {len(test_list_inductive)} interactions with new nodes")
 
-    return entities, relations, train_list, val_list, test_list_transductive, test_list_inductive, node_num
+    return entities, relations, full_train_list, full_val_list, test_list_transductive, test_list_inductive, node_num
 
 
 def get_llm_data(dataset_name: str, base_data_dir: str, val_ratio: float, test_ratio: float):
