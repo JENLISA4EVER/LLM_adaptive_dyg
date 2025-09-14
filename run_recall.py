@@ -16,6 +16,7 @@ from sentence_transformers import SentenceTransformer, util
 # 1. 数据加载与预处理函数
 # =====================================================================================
 
+
 def load_data_for_evaluation(dataset_name: str, base_data_dir: str, val_ratio: float, test_ratio: float):
     """
     【全新修订版】
@@ -29,48 +30,48 @@ def load_data_for_evaluation(dataset_name: str, base_data_dir: str, val_ratio: f
 
     entities = entity_df.sort_index()[['i', 'text']].values.tolist()
     relations = relation_df.sort_index()[['i', 'text']].values.tolist()
-    
+
     node_num = max(graph_df['u'].max(), graph_df['i'].max()) + 1
-    
+
     graph_df = graph_df.sort_values('ts').reset_index(drop=True)
 
-    # --- 步骤 1: 进行标准的时间划分，获得完整的训练和验证集 ---
-    n_total = len(graph_df)
-    n_val = int(n_total * val_ratio)
-    n_test = int(n_total * test_ratio)
-    n_train = n_total - n_val - n_test
+    # --- 步骤 1: 进行标准的时间划分 ---
+    val_time, test_time = np.quantile(graph_df.ts, [1 - val_ratio - test_ratio, 1 - test_ratio])
     
-    full_train_df = graph_df.iloc[:n_train]
-    full_val_df = graph_df.iloc[n_train : n_train + n_val]
-    
-    # 这部分是模型在测试时能看到的完整历史
-    full_train_list = full_train_df[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
-    full_val_list = full_val_df[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
-    
-    # --- 步骤 2: 单独使用 DTGB 逻辑来构造 inductive 测试集 ---
     src_node_ids = graph_df.u.values.astype(np.longlong)
     dst_node_ids = graph_df.i.values.astype(np.longlong)
     node_interact_times = graph_df.ts.values.astype(np.float64)
-    edge_ids = graph_df.r.values.astype(np.longlong)
-    labels = graph_df.label.values
 
-    val_time, test_time = np.quantile(node_interact_times, [1 - val_ratio - test_ratio, 1 - test_ratio])
-    
     random.seed(2020) # 固定种子以保证每次划分一致
     node_set = set(src_node_ids) | set(dst_node_ids)
+    
+    # --- 步骤 2: 识别inductive测试所需的新节点 ---
     test_node_set = set(src_node_ids[node_interact_times > val_time]).union(set(dst_node_ids[node_interact_times > val_time]))
     new_test_node_set = set(random.sample(list(test_node_set), int(0.1 * len(node_set))))
 
-    # 训练集掩码 (用于识别新节点时需要)
-    train_mask_for_new_node_identification = node_interact_times <= val_time
-    train_node_set = set(src_node_ids[train_mask_for_new_node_identification]) | set(dst_node_ids[train_mask_for_new_node_identification])
-    new_node_set = node_set - train_node_set
+    # --- 步骤 3: 构建严格的inductive训练集 ---
+    # 移除所有与新节点相关的历史交互，以创建用于识别新节点的训练环境
+    new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
+    new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
+    observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
     
-    # 生成 Transductive 和 Inductive 测试集
+    # 训练集掩码 (严格排除新节点)
+    train_mask_inductive = np.logical_and(node_interact_times <= val_time, observed_edges_mask)
+    
+    # --- 步骤 4: 准备评估所需的完整历史数据 ---
+    # 验证集和transductive测试集不受新节点筛选影响
+    train_mask_full = node_interact_times <= val_time
+    val_mask = np.logical_and(node_interact_times > val_time, node_interact_times <= test_time)
     test_mask = node_interact_times > test_time
+
+    # 完整历史交互（用于模型测试时更新）
+    full_train_list = graph_df[train_mask_full][['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
+    full_val_list = graph_df[val_mask][['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
+
+    # --- 步骤 5: 构建Transductive和Inductive两个独立的测试集 ---
     test_df_transductive = graph_df[test_mask]
     
-    edge_contains_new_node_mask = np.array([(src in new_node_set or dst in new_node_set) for src, dst in zip(src_node_ids, dst_node_ids)])
+    edge_contains_new_node_mask = np.array([(src in new_test_node_set or dst in new_test_node_set) for src, dst in zip(src_node_ids, dst_node_ids)])
     new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
     test_df_inductive = graph_df[new_node_test_mask]
 
@@ -119,6 +120,7 @@ def get_llm_data(dataset_name: str, base_data_dir: str, val_ratio: float, test_r
     test_list = test_df[['u', 'r', 'i', 'ts', 'label', 'idx']].values.tolist()
     
     return entities, relations, train_list, val_list, test_list, node_num, rel_num
+
 
 def get_query(qualruple: list):
     q_head = qualruple[0]

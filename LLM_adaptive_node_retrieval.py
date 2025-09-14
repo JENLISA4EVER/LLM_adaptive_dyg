@@ -275,144 +275,145 @@ def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_
     all_node_ids = list(range(node_num))
     
     # 按时间戳处理测试事件
-    test_events_grouped_by_time = itertools.groupby(test_list, key=lambda x: x[3])
+    test_events_grouped_by_time = itertools.groupby(full_test_flow, key=lambda x: x[3])
     for timestamp, events_at_this_time_iter in tqdm(test_events_grouped_by_time, desc="  评估检索任务 (按时间戳)"):
         events_at_this_time = list(events_at_this_time_iter)
         current_structural_embeddings = rp_module.get_all_projections().detach()
         
         for test_event in events_at_this_time:
-            processed_events_count += 1
-            q_head, q_rel, q_tail_true, q_time = get_query(test_event)
+            if tuple(test_event) in eval_event_set:
+                processed_events_count += 1
+                q_head, q_rel, q_tail_true, q_time = get_query(test_event)
 
-            # 步骤1: 获取自适应超参数
-            # 注意：这里需要从您的 LLM_adaptive_link_prediction.py 导入 get_adaptive_hyperparameters
-            # 并且在 main 函数中需要定义相关的 argparse 参数
-            adaptive_params = get_adaptive_hyperparameters(
-                 args, q_head, q_time, node_history, initial_history, all_semantic_embeddings, global_stats
-            )
+                # 步骤1: 获取自适应超参数
+                # 注意：这里需要从您的 LLM_adaptive_link_prediction.py 导入 get_adaptive_hyperparameters
+                # 并且在 main 函数中需要定义相关的 argparse 参数
+                adaptive_params = get_adaptive_hyperparameters(
+                    args, q_head, q_time, node_history, initial_history, all_semantic_embeddings, global_stats
+                )
 
-            # 使用自适应参数进行召回、打分、划分
-            if processed_events_count % args.print_interval == 0:
-                 print(f"\n   [Debug] 事件 {processed_events_count}: q_head={q_head}, "
-                       f"k_time={adaptive_params['k_time']}, k_struc={adaptive_params['k_struc']}, k_sem={adaptive_params['k_sem']}, "
-                       f"alpha={adaptive_params['alpha']:.3f}, beta={adaptive_params['beta']:.3f}")
-            
-            # --- 【修改】三路召回 (使用自适应k) ---
-            time_recalled_ids = {node_id for node_id, _ in get_active_i_set(q_time, adaptive_params['k_time'], initial_history)}
-            struc_recalled_ids = {node_id for node_id, _ in get_structural_nodes(q_head, adaptive_params['k_struc'], adj)}
-            sem_recalled_ids = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, adaptive_params['k_sem'], all_semantic_embeddings)}
-            candidate_set_C = time_recalled_ids.union(struc_recalled_ids, sem_recalled_ids)
-            
-            # 【修改】确保召回的节点总数不会太少
-            if len(candidate_set_C) < args.min_recall_num:
-                time_recalled_ids_fb = {node_id for node_id, _ in get_active_i_set(q_time, args.k_time, initial_history)}
-                struc_recalled_ids_fb = {node_id for node_id, _ in get_structural_nodes(q_head, args.k_struc, adj)}
-                sem_recalled_ids_fb = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, args.k_sem, all_semantic_embeddings)}
-                candidate_set_C.update(time_recalled_ids_fb)
-                candidate_set_C.update(struc_recalled_ids_fb)
-                candidate_set_C.update(sem_recalled_ids_fb)
-
-            if not candidate_set_C: continue
-
-            final_scores = calculate_candidate_scores(
-                q_head, q_time, candidate_set_C, node_history,
-                all_semantic_embeddings, current_structural_embeddings,
-                args.lambda_time, 
-                adaptive_params['alpha'], 
-                adaptive_params['beta']
-            )
-            future_pos_nodes, negative_nodes, ambiguous_nodes = partition_samples(final_scores, args.p, args.q)
-
-            
-            # 步骤2: 根据采样策略，构建包含num_neg个负样本的池子
-            negative_samples = set()
-            nodes_to_exclude_base = {q_head, q_tail_true} # 基础排除列表
-            
-            # 定义采样源
-            sampling_pool_source = []
-            if args.neg_sampling_strategy == 'hard_positive':
-                historical_partners = {p for p, _, _ in node_history.get(q_head, []) if _ < q_time}
-                future_partners = {e[2] for e in test_list if e[0] == q_head and e[3] > q_time}
-                nodes_to_exclude = nodes_to_exclude_base.union(historical_partners, future_partners)
-                sampling_pool_source = [n for n in future_pos_nodes if n not in nodes_to_exclude]
-            elif args.neg_sampling_strategy == 'ambiguous':
-                sampling_pool_source = [n for n in ambiguous_nodes if n not in nodes_to_exclude_base]
-            elif args.neg_sampling_strategy == 'negative':
-                sampling_pool_source = [n for n in negative_nodes if n not in nodes_to_exclude_base]
-            elif args.neg_sampling_strategy == 'recall_pool':
-                sampling_pool_source = [n for n in candidate_set_C if n not in nodes_to_exclude_base]
-            
-            # 从采样源中采样
-            if sampling_pool_source:
-                num_to_sample = min(args.num_neg, len(sampling_pool_source))
-                negative_samples.update(random.sample(sampling_pool_source, num_to_sample))
-
-            # 如果采样不足num_neg个 (源太小或全局采样)，用全局随机采样补足
-            while len(negative_samples) < args.num_neg:
-                neg_sample = random.choice(all_node_ids)
-                if neg_sample not in nodes_to_exclude_base and neg_sample not in negative_samples:
-                    negative_samples.add(neg_sample)
-            
-            # 步骤3: 构建最终的、打乱顺序的检索池
-            retrieval_pool = [q_tail_true] + list(negative_samples)
-            random.shuffle(retrieval_pool)
-
-            # 步骤4: 构建Prompt模板 (仅提供上下文，不包含具体候选者)
-            # 复用划分结果来创建丰富的上下文
-            u_history_for_verification = {(r_id, partner, t) for partner, r_id, t in node_history.get(q_head, []) if t < q_time}
-            future_pos_quads, neg_quads, ambiguous_quads = verify_and_create_sample_quadruples_optimized(
-                q_head, q_time, future_pos_nodes, ambiguous_nodes, negative_nodes, 
-                u_history_for_verification, node_history, relations_map
-            )
-            recent_u_history = node_history.get(q_head, [])[-args.num_golden_samples:]
-            golden_pos_quads = [(q_head, relations_map.get(r_id, f"Rel_{r_id}"), partner, t) for partner, r_id, t in recent_u_history if t < q_time]
-            prompt_template = build_few_shot_prompt(
-                q_head, q_time, golden_pos_quads, future_pos_quads, neg_quads[:20], ambiguous_quads
-            )
-            
-            # 步骤5: 调用批量打分函数
-            anchor_node = random.choice(all_node_ids)
-            while anchor_node in negative_samples or anchor_node in nodes_to_exclude_base:
-                anchor_node = random.choice(all_node_ids)
-            
-            '''
-            candidate_scores = batch_score_candidates_with_vllm(
-                prompt_template, q_head, retrieval_pool, anchor_node, llm=llm, tokenizer=tokenizer
-            )
-
-            '''
-            candidate_scores = batch_score_candidates_with_llm(
-                PROMPT_PREAMBLE + prompt_template, q_head, retrieval_pool, anchor_node, tokenizer, model
-            )
-            
-            
-            
-            # 步骤6: 排序并计算指标
-            sorted_candidates = sorted(candidate_scores, key=lambda x: x['score'], reverse=True)
-            try:
-                rank = [c['node_id'] for c in sorted_candidates].index(q_tail_true) + 1
-            except ValueError:
-                rank = 101
-            
-            mrr_sum += 1.0 / rank
-            for k in args.k_values:
-                if rank <= k:
-                    hits_at_k[k] += 1
-            
-            # 步骤7: 打印中间结果
-            if processed_events_count % args.print_interval == 0:
-                current_mrr = mrr_sum / processed_events_count
-                current_hits_str = ", ".join([f"H@{k}: {hits_at_k[k] / processed_events_count:.4f}" for k in args.k_values])
-                print(f"\n--- 中间指标 (事件 {processed_events_count}/{len(test_list)}) ---")
-                print(f"  MRR: {current_mrr:.4f}, {current_hits_str}")
+                # 使用自适应参数进行召回、打分、划分
+                if processed_events_count % args.print_interval == 0:
+                    print(f"\n   [Debug] 事件 {processed_events_count}: q_head={q_head}, "
+                        f"k_time={adaptive_params['k_time']}, k_struc={adaptive_params['k_struc']}, k_sem={adaptive_params['k_sem']}, "
+                        f"alpha={adaptive_params['alpha']:.3f}, beta={adaptive_params['beta']:.3f}")
                 
-                if plotter:
-                    metrics_for_plot = {f'Hits@{k}': hits_at_k[k] / processed_events_count for k in args.k_values}
-                    metrics_for_plot['MRR'] = current_mrr
-                    plotter.update_and_plot(
-                        event_count=processed_events_count,
-                        current_metrics=metrics_for_plot
-                    )
+                # --- 【修改】三路召回 (使用自适应k) ---
+                time_recalled_ids = {node_id for node_id, _ in get_active_i_set(q_time, adaptive_params['k_time'], initial_history)}
+                struc_recalled_ids = {node_id for node_id, _ in get_structural_nodes(q_head, adaptive_params['k_struc'], adj)}
+                sem_recalled_ids = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, adaptive_params['k_sem'], all_semantic_embeddings)}
+                candidate_set_C = time_recalled_ids.union(struc_recalled_ids, sem_recalled_ids)
+                
+                # 【修改】确保召回的节点总数不会太少
+                if len(candidate_set_C) < args.min_recall_num:
+                    time_recalled_ids_fb = {node_id for node_id, _ in get_active_i_set(q_time, args.k_time, initial_history)}
+                    struc_recalled_ids_fb = {node_id for node_id, _ in get_structural_nodes(q_head, args.k_struc, adj)}
+                    sem_recalled_ids_fb = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, args.k_sem, all_semantic_embeddings)}
+                    candidate_set_C.update(time_recalled_ids_fb)
+                    candidate_set_C.update(struc_recalled_ids_fb)
+                    candidate_set_C.update(sem_recalled_ids_fb)
+
+                if not candidate_set_C: continue
+
+                final_scores = calculate_candidate_scores(
+                    q_head, q_time, candidate_set_C, node_history,
+                    all_semantic_embeddings, current_structural_embeddings,
+                    args.lambda_time, 
+                    adaptive_params['alpha'], 
+                    adaptive_params['beta']
+                )
+                future_pos_nodes, negative_nodes, ambiguous_nodes = partition_samples(final_scores, args.p, args.q)
+
+                
+                # 步骤2: 根据采样策略，构建包含num_neg个负样本的池子
+                negative_samples = set()
+                nodes_to_exclude_base = {q_head, q_tail_true} # 基础排除列表
+                
+                # 定义采样源
+                sampling_pool_source = []
+                if args.neg_sampling_strategy == 'hard_positive':
+                    historical_partners = {p for p, _, _ in node_history.get(q_head, []) if _ < q_time}
+                    future_partners = {e[2] for e in test_list if e[0] == q_head and e[3] > q_time}
+                    nodes_to_exclude = nodes_to_exclude_base.union(historical_partners, future_partners)
+                    sampling_pool_source = [n for n in future_pos_nodes if n not in nodes_to_exclude]
+                elif args.neg_sampling_strategy == 'ambiguous':
+                    sampling_pool_source = [n for n in ambiguous_nodes if n not in nodes_to_exclude_base]
+                elif args.neg_sampling_strategy == 'negative':
+                    sampling_pool_source = [n for n in negative_nodes if n not in nodes_to_exclude_base]
+                elif args.neg_sampling_strategy == 'recall_pool':
+                    sampling_pool_source = [n for n in candidate_set_C if n not in nodes_to_exclude_base]
+                
+                # 从采样源中采样
+                if sampling_pool_source:
+                    num_to_sample = min(args.num_neg, len(sampling_pool_source))
+                    negative_samples.update(random.sample(sampling_pool_source, num_to_sample))
+
+                # 如果采样不足num_neg个 (源太小或全局采样)，用全局随机采样补足
+                while len(negative_samples) < args.num_neg:
+                    neg_sample = random.choice(all_node_ids)
+                    if neg_sample not in nodes_to_exclude_base and neg_sample not in negative_samples:
+                        negative_samples.add(neg_sample)
+                
+                # 步骤3: 构建最终的、打乱顺序的检索池
+                retrieval_pool = [q_tail_true] + list(negative_samples)
+                random.shuffle(retrieval_pool)
+
+                # 步骤4: 构建Prompt模板 (仅提供上下文，不包含具体候选者)
+                # 复用划分结果来创建丰富的上下文
+                u_history_for_verification = {(r_id, partner, t) for partner, r_id, t in node_history.get(q_head, []) if t < q_time}
+                future_pos_quads, neg_quads, ambiguous_quads = verify_and_create_sample_quadruples_optimized(
+                    q_head, q_time, future_pos_nodes, ambiguous_nodes, negative_nodes, 
+                    u_history_for_verification, node_history, relations_map
+                )
+                recent_u_history = node_history.get(q_head, [])[-args.num_golden_samples:]
+                golden_pos_quads = [(q_head, relations_map.get(r_id, f"Rel_{r_id}"), partner, t) for partner, r_id, t in recent_u_history if t < q_time]
+                prompt_template = build_few_shot_prompt(
+                    q_head, q_time, golden_pos_quads, future_pos_quads, neg_quads[:20], ambiguous_quads
+                )
+                
+                # 步骤5: 调用批量打分函数
+                anchor_node = random.choice(all_node_ids)
+                while anchor_node in negative_samples or anchor_node in nodes_to_exclude_base:
+                    anchor_node = random.choice(all_node_ids)
+                
+                '''
+                candidate_scores = batch_score_candidates_with_vllm(
+                    prompt_template, q_head, retrieval_pool, anchor_node, llm=llm, tokenizer=tokenizer
+                )
+
+                '''
+                candidate_scores = batch_score_candidates_with_llm(
+                    PROMPT_PREAMBLE + prompt_template, q_head, retrieval_pool, anchor_node, tokenizer, model
+                )
+                
+                
+                
+                # 步骤6: 排序并计算指标
+                sorted_candidates = sorted(candidate_scores, key=lambda x: x['score'], reverse=True)
+                try:
+                    rank = [c['node_id'] for c in sorted_candidates].index(q_tail_true) + 1
+                except ValueError:
+                    rank = 101
+                
+                mrr_sum += 1.0 / rank
+                for k in args.k_values:
+                    if rank <= k:
+                        hits_at_k[k] += 1
+                
+                # 步骤7: 打印中间结果
+                if processed_events_count % args.print_interval == 0:
+                    current_mrr = mrr_sum / processed_events_count
+                    current_hits_str = ", ".join([f"H@{k}: {hits_at_k[k] / processed_events_count:.4f}" for k in args.k_values])
+                    print(f"\n--- 中间指标 (事件 {processed_events_count}/{len(test_list)}) ---")
+                    print(f"  MRR: {current_mrr:.4f}, {current_hits_str}")
+                    
+                    if plotter:
+                        metrics_for_plot = {f'Hits@{k}': hits_at_k[k] / processed_events_count for k in args.k_values}
+                        metrics_for_plot['MRR'] = current_mrr
+                        plotter.update_and_plot(
+                            event_count=processed_events_count,
+                            current_metrics=metrics_for_plot
+                        )
 
         # 增量更新
         rp_module.update(np.array([e[0] for e in events_at_this_time]), np.array([e[2] for e in events_at_this_time]), np.array([e[3] for e in events_at_this_time]))
@@ -526,23 +527,28 @@ def main():
     entities, relations, train_list, val_list, test_list_trans, test_list_ind, node_num = load_data_for_evaluation(
         args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
     )
-    
-    # 根据 setting 选择测试集
-    if args.setting == 'transductive':
-        test_list = test_list_trans
-    else: # inductive
-        test_list = test_list_ind
-        
     relations_map = {rel_id: rel_text for rel_id, rel_text in relations}
-
+    
     print("\n--- 2. 正在准备节点语义向量... ---")
     embedding_file_path = os.path.join(args.base_data_dir, args.dataset_name, f"{args.dataset_name}_entity_embeddings.pt")
     all_semantic_embeddings = get_or_compute_entity_embeddings(
         entities=entities, model_path=args.local_model_path, file_path=embedding_file_path, device=args.device
     )
+    
+    if args.setting == 'transductive':
+        test_list_for_eval = test_list_trans
+        full_test_flow = test_list_trans  # Transductive模式下，评估流就是测试集本身
+    else: # inductive
+        test_list_for_eval = test_list_ind
+        # Inductive模式下，评估流是完整的transductive测试集，以保证时序连续性
+        full_test_flow = test_list_trans 
+    
+    # 将 test_list_for_eval 转换为一个set，方便快速查找
+    eval_event_set = {tuple(event) for event in test_list_for_eval}
 
+    # 调用评估函数，传入 full_test_flow 和 eval_event_set
     evaluate_retrieval_task(
-        args, train_list, val_list, test_list, 
+        args, train_list, val_list, full_test_flow, eval_event_set,
         all_semantic_embeddings, relations_map, node_num
     )
 

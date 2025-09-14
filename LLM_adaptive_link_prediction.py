@@ -295,7 +295,7 @@ def predict_with_llm(
 # 主评估流程
 # =====================================================================================
 
-def evaluate_link_prediction_optimized(args, train_list, val_list, test_list, all_semantic_embeddings, relations_map, node_num):
+def evaluate_link_prediction_optimized(args, train_list, val_list, full_test_flow, eval_event_set, all_semantic_embeddings, relations_map, node_num):
     """
     【最终版的主评估函数】
     集成了三路召回、评分权重、样本划分的完整自适应逻辑。
@@ -398,7 +398,7 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, test_list, al
 
     few_shot_manager = None
     if args.enable_dynamic_few_shot:
-        few_shot_manager = FewShotManager(max_examples=3)
+        few_shot_manager = FewShotManager(max_examples=args.num_fs)
 
     print("   - 所有模块初始化完成.")
 
@@ -411,207 +411,208 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, test_list, al
     total_test_events = len(test_list)
     processed_events_count = 0
 
-    test_events_grouped_by_time = itertools.groupby(test_list, key=lambda x: x[3])
+    test_events_grouped_by_time = itertools.groupby(full_test_flow, key=lambda x: x[3])
 
     for timestamp, events_at_this_time_iter in tqdm(test_events_grouped_by_time, desc="  评估测试集 (按时间戳)"):
         events_at_this_time = list(events_at_this_time_iter)
         current_structural_embeddings = rp_module.get_all_projections().detach()
         
         for test_event in events_at_this_time:
-            processed_events_count += 1
-            q_head, q_rel, q_tail_true, q_time = get_query(test_event)
+            if tuple(test_event) in eval_event_set:
+                processed_events_count += 1
+                q_head, q_rel, q_tail_true, q_time = get_query(test_event)
 
-            # --- 【修改】获取所有自适应超参数 ---
-            adaptive_params = get_adaptive_hyperparameters(
-                args, q_head, q_time, node_history, initial_history, all_semantic_embeddings, global_stats
-            )
-            if processed_events_count % args.print_interval == 0:
-                 print(f"\n   [Debug] 事件 {processed_events_count}: q_head={q_head}, "
-                       f"k_time={adaptive_params['k_time']}, k_struc={adaptive_params['k_struc']}, k_sem={adaptive_params['k_sem']}, "
-                       f"alpha={adaptive_params['alpha']:.3f}, beta={adaptive_params['beta']:.3f}")
-            
-            # --- 【修改】三路召回 (使用自适应k) ---
-            time_recalled_ids = {node_id for node_id, _ in get_active_i_set(q_time, adaptive_params['k_time'], initial_history)}
-            struc_recalled_ids = {node_id for node_id, _ in get_structural_nodes(q_head, adaptive_params['k_struc'], adj)}
-            sem_recalled_ids = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, adaptive_params['k_sem'], all_semantic_embeddings)}
-            candidate_set_C = time_recalled_ids.union(struc_recalled_ids, sem_recalled_ids)
-            
-            # 【修改】确保召回的节点总数不会太少
-            if len(candidate_set_C) < args.min_recall_num:
-                time_recalled_ids_fb = {node_id for node_id, _ in get_active_i_set(q_time, args.k_time, initial_history)}
-                struc_recalled_ids_fb = {node_id for node_id, _ in get_structural_nodes(q_head, args.k_struc, adj)}
-                sem_recalled_ids_fb = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, args.k_sem, all_semantic_embeddings)}
-                candidate_set_C.update(time_recalled_ids_fb)
-                candidate_set_C.update(struc_recalled_ids_fb)
-                candidate_set_C.update(sem_recalled_ids_fb)
-
-            if not candidate_set_C: continue
-            
-            # --- 【修改】评分 (使用自适应alpha, beta) ---
-            final_scores = calculate_candidate_scores(
-                q_head, q_time, candidate_set_C, node_history,
-                all_semantic_embeddings, current_structural_embeddings,
-                args.lambda_time, adaptive_params['alpha'], adaptive_params['beta'] # 使用自适应alpha, beta
-            )
-            
-            # --- 【修改】构建 Prompt (使用自适应样本划分) ---
-            if args.adaptive_pq:
-                future_pos_nodes, negative_nodes, ambiguous_nodes = partition_samples_adaptive(
-                    final_scores, args.p, args.q, args.p_std_factor, args.p_min_count
+                # --- 【修改】获取所有自适应超参数 ---
+                adaptive_params = get_adaptive_hyperparameters(
+                    args, q_head, q_time, node_history, initial_history, all_semantic_embeddings, global_stats
                 )
-            else:
-                future_pos_nodes, negative_nodes, ambiguous_nodes = partition_samples(final_scores, args.p, args.q)
-
-            
-            # --- [修改] 负采样策略 ---
-            q_tail_neg = None
-            fallback_sampling = False
-
-            if args.neg_sampling_strategy == 'recall_pool':
-                # 策略5: 为负采样，使用默认k值重新构建一个独立的召回池
+                if processed_events_count % args.print_interval == 0:
+                    print(f"\n   [Debug] 事件 {processed_events_count}: q_head={q_head}, "
+                        f"k_time={adaptive_params['k_time']}, k_struc={adaptive_params['k_struc']}, k_sem={adaptive_params['k_sem']}, "
+                        f"alpha={adaptive_params['alpha']:.3f}, beta={adaptive_params['beta']:.3f}")
                 
-                # 1. 使用默认k值 (args.k_*) 进行三路召回
-                time_recalled_ids_neg = {node_id for node_id, _ in get_active_i_set(q_time, 55, initial_history)}
-                struc_recalled_ids_neg = {node_id for node_id, _ in get_structural_nodes(q_head, 55, adj)}
-                sem_recalled_ids_neg = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, 55, all_semantic_embeddings)}
+                # --- 【修改】三路召回 (使用自适应k) ---
+                time_recalled_ids = {node_id for node_id, _ in get_active_i_set(q_time, adaptive_params['k_time'], initial_history)}
+                struc_recalled_ids = {node_id for node_id, _ in get_structural_nodes(q_head, adaptive_params['k_struc'], adj)}
+                sem_recalled_ids = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, adaptive_params['k_sem'], all_semantic_embeddings)}
+                candidate_set_C = time_recalled_ids.union(struc_recalled_ids, sem_recalled_ids)
                 
-                # 2. 合并成一个专用于负采样的召回池
-                neg_sampling_recall_pool = time_recalled_ids_neg.union(struc_recalled_ids_neg, sem_recalled_ids_neg)
+                # 【修改】确保召回的节点总数不会太少
+                if len(candidate_set_C) < args.min_recall_num:
+                    time_recalled_ids_fb = {node_id for node_id, _ in get_active_i_set(q_time, args.k_time, initial_history)}
+                    struc_recalled_ids_fb = {node_id for node_id, _ in get_structural_nodes(q_head, args.k_struc, adj)}
+                    sem_recalled_ids_fb = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, args.k_sem, all_semantic_embeddings)}
+                    candidate_set_C.update(time_recalled_ids_fb)
+                    candidate_set_C.update(struc_recalled_ids_fb)
+                    candidate_set_C.update(sem_recalled_ids_fb)
 
-                # 3. 从这个新生成的、非自适应的池子中进行负采样
-                potential_negatives = list(neg_sampling_recall_pool - {q_head, q_tail_true})
+                if not candidate_set_C: continue
                 
-                if potential_negatives:
-                    q_tail_neg = random.choice(potential_negatives)
-                else:
-                    # 如果新池子为空或只有无效节点，则退回全局采样
-                    fallback_sampling = True
-            
-            if args.neg_sampling_strategy == 'hard_positive':
-                # 策略2: 从未来正样本中采样，且不能是历史伙伴或未来真实伙伴
-                # 1. 获取所有在历史中交互过的伙伴
-                historical_partners = {partner for partner, r_id, t in node_history.get(q_head, []) if t < q_time}
-                # 2. [新增] 获取所有在未来 (t' > q_time) 将会交互的真实伙伴
-                #    这需要遍历整个测试集来预知未来
-                future_partners = {event[2] for event in test_list if event[0] == q_head and event[3] > q_time}
-                # 3. 合并历史与未来两种需要排除的节点
-                nodes_to_exclude = historical_partners.union(future_partners)
-                # 4. 从“未来正样本”池中过滤掉所有应排除的节点以及本次查询的正确答案
-                potential_negatives = [
-                    node for node in future_pos_nodes 
-                    if node != q_tail_true and node not in nodes_to_exclude
-                ]
-                if potential_negatives:
-                    q_tail_neg = random.choice(potential_negatives)
-                else:
-                    # 如果过滤后没有候选者，则启用备用采样
-                    fallback_sampling = True
-
-            elif args.neg_sampling_strategy == 'ambiguous':
-                # 策略3: 从模糊样本中采样
-                potential_negatives = [node for node in ambiguous_nodes if node != q_tail_true]
-                if potential_negatives:
-                    q_tail_neg = random.choice(potential_negatives)
-                else:
-                    fallback_sampling = True
-
-            elif args.neg_sampling_strategy == 'negative':
-                # 策略4: 从负样本中采样
-                potential_negatives = [node for node in negative_nodes if node != q_tail_true]
-                if potential_negatives:
-                    q_tail_neg = random.choice(potential_negatives)
-                else:
-                    fallback_sampling = True
-            
-            
-            
-            # 策略1 (global) 或任何策略的备用方案
-            if args.neg_sampling_strategy == 'global' or fallback_sampling:
-                q_tail_neg = random.choice(all_node_ids)
-                while q_tail_neg == q_tail_true or q_tail_neg == q_head:
-                    q_tail_neg = random.choice(all_node_ids)
-            # --- [修改] 负采样结束 ---
-
-
-            # --- [修改] 确保负样本不出现在Prompt的正面证据中 ---
-            # 这一步是为了防止给LLM矛盾的信息
-            prompt_future_pos_nodes = [node for node in future_pos_nodes if node != q_tail_neg]
-            prompt_ambiguous_nodes = [node for node in ambiguous_nodes if node != q_tail_neg]
-
-            
-
-            # (后续的样本构建、Prompt、预测、更新逻辑完全不变)
-            # 1. 高效地为验证准备u的历史集合
-            u_history_for_verification = set()
-            if q_head in node_history:
-                for partner, r_id, t in node_history[q_head]:
-                    if t < q_time:
-                        u_history_for_verification.add((r_id, partner, t))
-            
-            # 2. 调用新的高效函数填充 quad 列表
-            future_pos_quads, neg_quads, ambiguous_quads = verify_and_create_sample_quadruples_optimized(
-                q_head, q_time, prompt_future_pos_nodes, prompt_ambiguous_nodes, negative_nodes, 
-                u_history_for_verification, node_history, relations_map
-            )
-
-            # 3. 获取黄金正样本
-            recent_u_history = node_history.get(q_head, [])[-args.num_golden_samples:]
-            # 注意: 此处的关系获取需要适配新node_history格式
-            golden_pos_quads = []
-            for partner, r_id, t in recent_u_history:
-                 if t < q_time:
-                    r_text = relations_map.get(r_id, f"Rel_{r_id}")
-                    golden_pos_quads.append((q_head, r_text, partner, t))
-
-            # 4. 构建最终Prompt
-            # 【修改】在构建Prompt前，先获取few-shot上下文
-            few_shot_context = ""
-            if few_shot_manager:
-                few_shot_context = few_shot_manager.get_few_shot_context()
-
-            base_prompt_template = build_few_shot_prompt(
-                q_head, q_time, golden_pos_quads, future_pos_quads, neg_quads[:20], ambiguous_quads
-            )
-            # 【修改】将few-shot上下文添加到主prompt之前
-            current_prompt_template = few_shot_context + PROMPT_PREAMBLE + base_prompt_template
-            # if len(few_shot_context) > 0: print(current_prompt_template)
-
-            # --- 预测与位置校准 ---
-            prediction1, probabilities1 = predict_with_llm(current_prompt_template, q_head, q_tail_true, q_tail_neg, tokenizer, model)
-            prediction2, probabilities2 = predict_with_llm(current_prompt_template, q_head, q_tail_neg, q_tail_true, tokenizer, model)
-            
-            calibrated_score_for_true_node = (probabilities1['A'] + probabilities2['B']) / 2.0
-            calibrated_score_for_neg_node = (probabilities1['B'] + probabilities2['A']) / 2.0
-
-            # 【新增】判断预测是否错误，并生成新的few-shot样本
-            if few_shot_manager and few_shot_manager.can_add_more() and probabilities1['A'] >= probabilities1['B']:
-                few_shot_manager.generate_and_add_example(
-                    prompt_preamble=PROMPT_PREAMBLE,
-                    failed_prompt_template=base_prompt_template, # 使用不包含旧示例的模板
-                    q_head=q_head,
-                    v_true=q_tail_true,
-                    v_neg=q_tail_neg,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=args.device
+                # --- 【修改】评分 (使用自适应alpha, beta) ---
+                final_scores = calculate_candidate_scores(
+                    q_head, q_time, candidate_set_C, node_history,
+                    all_semantic_embeddings, current_structural_embeddings,
+                    args.lambda_time, adaptive_params['alpha'], adaptive_params['beta'] # 使用自适应alpha, beta
                 )
-
-
-            all_calibrated_scores.extend([calibrated_score_for_true_node, calibrated_score_for_neg_node])
-            all_labels.extend([1, 0])
-
-            # --- 打印中间结果 ---
-            if processed_events_count % args.print_interval == 0 and len(all_labels) > 1:
-                current_auc = roc_auc_score(all_labels, all_calibrated_scores)
-                current_ap = average_precision_score(all_labels, all_calibrated_scores)
-                print(f"\n--- 中间指标 (事件 {processed_events_count}/{total_test_events}) --- ROC AUC: {current_auc:.4f}, AP: {current_ap:.4f}")
-
-                # 【新增】调用绘图模块
-                if plotter:
-                    plotter.update_and_plot(
-                        event_count=processed_events_count,
-                        current_metrics={'ROC AUC': current_auc, 'AP': current_ap}
+                
+                # --- 【修改】构建 Prompt (使用自适应样本划分) ---
+                if args.adaptive_pq:
+                    future_pos_nodes, negative_nodes, ambiguous_nodes = partition_samples_adaptive(
+                        final_scores, args.p, args.q, args.p_std_factor, args.p_min_count
                     )
+                else:
+                    future_pos_nodes, negative_nodes, ambiguous_nodes = partition_samples(final_scores, args.p, args.q)
+
+                
+                # --- [修改] 负采样策略 ---
+                q_tail_neg = None
+                fallback_sampling = False
+
+                if args.neg_sampling_strategy == 'recall_pool':
+                    # 策略5: 为负采样，使用默认k值重新构建一个独立的召回池
+                    
+                    # 1. 使用默认k值 (args.k_*) 进行三路召回
+                    time_recalled_ids_neg = {node_id for node_id, _ in get_active_i_set(q_time, 55, initial_history)}
+                    struc_recalled_ids_neg = {node_id for node_id, _ in get_structural_nodes(q_head, 55, adj)}
+                    sem_recalled_ids_neg = {node_id for node_id, _ in get_semantically_similar_nodes(q_head, 55, all_semantic_embeddings)}
+                    
+                    # 2. 合并成一个专用于负采样的召回池
+                    neg_sampling_recall_pool = time_recalled_ids_neg.union(struc_recalled_ids_neg, sem_recalled_ids_neg)
+
+                    # 3. 从这个新生成的、非自适应的池子中进行负采样
+                    potential_negatives = list(neg_sampling_recall_pool - {q_head, q_tail_true})
+                    
+                    if potential_negatives:
+                        q_tail_neg = random.choice(potential_negatives)
+                    else:
+                        # 如果新池子为空或只有无效节点，则退回全局采样
+                        fallback_sampling = True
+                
+                if args.neg_sampling_strategy == 'hard_positive':
+                    # 策略2: 从未来正样本中采样，且不能是历史伙伴或未来真实伙伴
+                    # 1. 获取所有在历史中交互过的伙伴
+                    historical_partners = {partner for partner, r_id, t in node_history.get(q_head, []) if t < q_time}
+                    # 2. [新增] 获取所有在未来 (t' > q_time) 将会交互的真实伙伴
+                    #    这需要遍历整个测试集来预知未来
+                    future_partners = {event[2] for event in test_list if event[0] == q_head and event[3] > q_time}
+                    # 3. 合并历史与未来两种需要排除的节点
+                    nodes_to_exclude = historical_partners.union(future_partners)
+                    # 4. 从“未来正样本”池中过滤掉所有应排除的节点以及本次查询的正确答案
+                    potential_negatives = [
+                        node for node in future_pos_nodes 
+                        if node != q_tail_true and node not in nodes_to_exclude
+                    ]
+                    if potential_negatives:
+                        q_tail_neg = random.choice(potential_negatives)
+                    else:
+                        # 如果过滤后没有候选者，则启用备用采样
+                        fallback_sampling = True
+
+                elif args.neg_sampling_strategy == 'ambiguous':
+                    # 策略3: 从模糊样本中采样
+                    potential_negatives = [node for node in ambiguous_nodes if node != q_tail_true]
+                    if potential_negatives:
+                        q_tail_neg = random.choice(potential_negatives)
+                    else:
+                        fallback_sampling = True
+
+                elif args.neg_sampling_strategy == 'negative':
+                    # 策略4: 从负样本中采样
+                    potential_negatives = [node for node in negative_nodes if node != q_tail_true]
+                    if potential_negatives:
+                        q_tail_neg = random.choice(potential_negatives)
+                    else:
+                        fallback_sampling = True
+                
+                
+                
+                # 策略1 (global) 或任何策略的备用方案
+                if args.neg_sampling_strategy == 'global' or fallback_sampling:
+                    q_tail_neg = random.choice(all_node_ids)
+                    while q_tail_neg == q_tail_true or q_tail_neg == q_head:
+                        q_tail_neg = random.choice(all_node_ids)
+                # --- [修改] 负采样结束 ---
+
+
+                # --- [修改] 确保负样本不出现在Prompt的正面证据中 ---
+                # 这一步是为了防止给LLM矛盾的信息
+                prompt_future_pos_nodes = [node for node in future_pos_nodes if node != q_tail_neg]
+                prompt_ambiguous_nodes = [node for node in ambiguous_nodes if node != q_tail_neg]
+
+                
+
+                # (后续的样本构建、Prompt、预测、更新逻辑完全不变)
+                # 1. 高效地为验证准备u的历史集合
+                u_history_for_verification = set()
+                if q_head in node_history:
+                    for partner, r_id, t in node_history[q_head]:
+                        if t < q_time:
+                            u_history_for_verification.add((r_id, partner, t))
+                
+                # 2. 调用新的高效函数填充 quad 列表
+                future_pos_quads, neg_quads, ambiguous_quads = verify_and_create_sample_quadruples_optimized(
+                    q_head, q_time, prompt_future_pos_nodes, prompt_ambiguous_nodes, negative_nodes, 
+                    u_history_for_verification, node_history, relations_map
+                )
+
+                # 3. 获取黄金正样本
+                recent_u_history = node_history.get(q_head, [])[-args.num_golden_samples:]
+                # 注意: 此处的关系获取需要适配新node_history格式
+                golden_pos_quads = []
+                for partner, r_id, t in recent_u_history:
+                    if t < q_time:
+                        r_text = relations_map.get(r_id, f"Rel_{r_id}")
+                        golden_pos_quads.append((q_head, r_text, partner, t))
+
+                # 4. 构建最终Prompt
+                # 【修改】在构建Prompt前，先获取few-shot上下文
+                few_shot_context = ""
+                if few_shot_manager:
+                    few_shot_context = few_shot_manager.get_few_shot_context()
+
+                base_prompt_template = build_few_shot_prompt(
+                    q_head, q_time, golden_pos_quads, future_pos_quads, neg_quads[:20], ambiguous_quads
+                )
+                # 【修改】将few-shot上下文添加到主prompt之前
+                current_prompt_template = few_shot_context + PROMPT_PREAMBLE + base_prompt_template
+                # if len(few_shot_context) > 0: print(current_prompt_template)
+
+                # --- 预测与位置校准 ---
+                prediction1, probabilities1 = predict_with_llm(current_prompt_template, q_head, q_tail_true, q_tail_neg, tokenizer, model)
+                prediction2, probabilities2 = predict_with_llm(current_prompt_template, q_head, q_tail_neg, q_tail_true, tokenizer, model)
+                
+                calibrated_score_for_true_node = (probabilities1['A'] + probabilities2['B']) / 2.0
+                calibrated_score_for_neg_node = (probabilities1['B'] + probabilities2['A']) / 2.0
+
+                # 【新增】判断预测是否错误，并生成新的few-shot样本
+                if few_shot_manager and few_shot_manager.can_add_more() and probabilities1['A'] >= probabilities1['B']:
+                    few_shot_manager.generate_and_add_example(
+                        prompt_preamble=PROMPT_PREAMBLE,
+                        failed_prompt_template=base_prompt_template, # 使用不包含旧示例的模板
+                        q_head=q_head,
+                        v_true=q_tail_true,
+                        v_neg=q_tail_neg,
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=args.device
+                    )
+
+
+                all_calibrated_scores.extend([calibrated_score_for_true_node, calibrated_score_for_neg_node])
+                all_labels.extend([1, 0])
+
+                # --- 打印中间结果 ---
+                if processed_events_count % args.print_interval == 0 and len(all_labels) > 1:
+                    current_auc = roc_auc_score(all_labels, all_calibrated_scores)
+                    current_ap = average_precision_score(all_labels, all_calibrated_scores)
+                    print(f"\n--- 中间指标 (事件 {processed_events_count}/{total_test_events}) --- ROC AUC: {current_auc:.4f}, AP: {current_ap:.4f}")
+
+                    # 【新增】调用绘图模块
+                    if plotter:
+                        plotter.update_and_plot(
+                            event_count=processed_events_count,
+                            current_metrics={'ROC AUC': current_auc, 'AP': current_ap}
+                        )
 
 
         # 2b. 更新阶段：用刚刚处理完的事件来更新状态
@@ -678,7 +679,8 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='运行设备 (cuda or cpu)')
     parser.add_argument('--enable_plotting', action='store_true', help='Enable real-time plotting of performance metrics.')
     parser.add_argument('--seed_value', type=int, default=42, help='随机种子数值')
-    
+    parser.add_argument('--num_fs', type=int, default=3, help='少样本示例个数')
+
     # --- 负采样策略参数 ---
     parser.add_argument(
         '--neg_sampling_strategy',
@@ -733,22 +735,28 @@ def main():
         args.dataset_name, args.base_data_dir, val_ratio=0.15, test_ratio=0.15
     )
     
-    # 根据 setting 选择测试集
-    if args.setting == 'transductive':
-        test_list = test_list_trans
-    else: # inductive
-        test_list = test_list_ind
-        
     relations_map = {rel_id: rel_text for rel_id, rel_text in relations}
-
+    
     print("\n--- 2. 正在准备节点语义向量... ---")
     embedding_file_path = os.path.join(args.base_data_dir, args.dataset_name, f"{args.dataset_name}_entity_embeddings.pt")
     all_semantic_embeddings = get_or_compute_entity_embeddings(
         entities=entities, model_path=args.local_model_path, file_path=embedding_file_path, device=args.device
     )
 
+    if args.setting == 'transductive':
+        test_list_for_eval = test_list_trans
+        full_test_flow = test_list_trans  # Transductive模式下，评估流就是测试集本身
+    else: # inductive
+        test_list_for_eval = test_list_ind
+        # Inductive模式下，评估流是完整的transductive测试集，以保证时序连续性
+        full_test_flow = test_list_trans 
+    
+    # 将 test_list_for_eval 转换为一个set，方便快速查找
+    eval_event_set = {tuple(event) for event in test_list_for_eval}
+
+    # 调用评估函数，传入 full_test_flow 和 eval_event_set
     evaluate_link_prediction_optimized(
-        args, train_list, val_list, test_list, 
+        args, train_list, val_list, full_test_flow, eval_event_set,
         all_semantic_embeddings, relations_map, node_num
     )
 
