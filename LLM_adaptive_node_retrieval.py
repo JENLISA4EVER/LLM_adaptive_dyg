@@ -170,7 +170,7 @@ def batch_score_candidates_with_llm(
 # 2. 核心评估函数：整合了所有策略
 # =====================================================================================
 
-def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_embeddings, relations_map, node_num):
+def evaluate_retrieval_task(args, train_list, val_list, full_test_flow, eval_event_set, all_semantic_embeddings, relations_map, node_num):
     print(f"\n--- 5. 开始节点检索评估 [采样策略: {args.neg_sampling_strategy}] ---")
 
     PROMPT_PREAMBLE = ""
@@ -333,7 +333,7 @@ def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_
                 sampling_pool_source = []
                 if args.neg_sampling_strategy == 'hard_positive':
                     historical_partners = {p for p, _, _ in node_history.get(q_head, []) if _ < q_time}
-                    future_partners = {e[2] for e in test_list if e[0] == q_head and e[3] > q_time}
+                    future_partners = {e[2] for e in full_test_flow if e[0] == q_head and e[3] > q_time}
                     nodes_to_exclude = nodes_to_exclude_base.union(historical_partners, future_partners)
                     sampling_pool_source = [n for n in future_pos_nodes if n not in nodes_to_exclude]
                 elif args.neg_sampling_strategy == 'ambiguous':
@@ -404,7 +404,7 @@ def evaluate_retrieval_task(args, train_list, val_list, test_list, all_semantic_
                 if processed_events_count % args.print_interval == 0:
                     current_mrr = mrr_sum / processed_events_count
                     current_hits_str = ", ".join([f"H@{k}: {hits_at_k[k] / processed_events_count:.4f}" for k in args.k_values])
-                    print(f"\n--- 中间指标 (事件 {processed_events_count}/{len(test_list)}) ---")
+                    print(f"\n--- 中间指标 (事件 {processed_events_count}/{len(full_test_flow)}) ---")
                     print(f"  MRR: {current_mrr:.4f}, {current_hits_str}")
                     
                     if plotter:

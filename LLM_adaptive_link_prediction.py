@@ -408,7 +408,7 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, full_test_flo
     print("   - Phase 2: 按时间戳进行评估和增量更新...")
     all_calibrated_scores, all_labels = [], []
     all_node_ids = list(range(node_num))
-    total_test_events = len(test_list)
+    total_test_events = len(full_test_flow)
     processed_events_count = 0
 
     test_events_grouped_by_time = itertools.groupby(full_test_flow, key=lambda x: x[3])
@@ -494,7 +494,7 @@ def evaluate_link_prediction_optimized(args, train_list, val_list, full_test_flo
                     historical_partners = {partner for partner, r_id, t in node_history.get(q_head, []) if t < q_time}
                     # 2. [新增] 获取所有在未来 (t' > q_time) 将会交互的真实伙伴
                     #    这需要遍历整个测试集来预知未来
-                    future_partners = {event[2] for event in test_list if event[0] == q_head and event[3] > q_time}
+                    future_partners = {event[2] for event in full_test_flow if event[0] == q_head and event[3] > q_time}
                     # 3. 合并历史与未来两种需要排除的节点
                     nodes_to_exclude = historical_partners.union(future_partners)
                     # 4. 从“未来正样本”池中过滤掉所有应排除的节点以及本次查询的正确答案

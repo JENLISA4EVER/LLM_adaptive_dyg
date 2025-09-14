@@ -134,18 +134,20 @@ def get_query(qualruple: list):
 # =====================================================================================
 
 def get_active_i_set(q_time: int, top_k: int, all_events: list) -> list:
-    """
-    获取在 q_time 这个时间戳之前，最近 top_k 个发生过交互的节点列表。
-    *注：此函数已修改为直接接收所需参数，而不是依赖全局变量。*
-    """
     active_nodes = {}
-    for event in all_events:
+    # 从后往前遍历，可以更快地找到最近的事件
+    for event in reversed(all_events):
         e_time = event[3]
         if e_time >= q_time:
-            break
-        active_nodes[event[0]] = e_time
-        active_nodes[event[2]] = e_time
+            continue
         
+        # 当我们已经找到足够多的活跃节点时，可以提前中断
+        # (这个优化比较复杂，暂时只做反向遍历)
+        if event[0] not in active_nodes:
+            active_nodes[event[0]] = e_time
+        if event[2] not in active_nodes:
+            active_nodes[event[2]] = e_time
+            
     sorted_active_nodes = sorted(active_nodes.items(), key=lambda item: item[1], reverse=True)
     return [(node, time) for node, time in sorted_active_nodes[:top_k]]
 
